@@ -40,18 +40,6 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn format_size_padded(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    match bytes {
-        b if b >= GB => format!("{:>6.1} GB", b as f64 / GB as f64),
-        b if b >= MB => format!("{:>6.1} MB", b as f64 / MB as f64),
-        b if b >= KB => format!("{:>6.1} KB", b as f64 / KB as f64),
-        b => format!("{:>6} B ", b),
-    }
-}
-
 /// Green(0) → Yellow(mid) → Red(upper), log + power-curve scale
 fn size_color(bytes: u64, upper: u64) -> egui::Color32 {
     if bytes == 0 || upper == 0 {
@@ -134,6 +122,7 @@ struct Filters {
     hide_build: bool,
     hide_obj_files: bool,
     hide_lock_files: bool,
+    respect_gitignore: bool,
 }
 
 impl Default for Filters {
@@ -146,6 +135,7 @@ impl Default for Filters {
             hide_build: false,
             hide_obj_files: false,
             hide_lock_files: false,
+            respect_gitignore: true,
         }
     }
 }
@@ -319,7 +309,7 @@ impl Default for SearchState {
 }
 
 impl SearchState {
-    fn start(&mut self, root: &Path) {
+    fn start(&mut self, root: &Path, filters: &Filters) {
         if let Some(h) = &self.handle {
             h.cancel.store(true, Ordering::Relaxed);
         }
@@ -327,7 +317,7 @@ impl SearchState {
         self.done = false;
         self.started_at = Some(Instant::now());
         self.elapsed_ms = 0.0;
-        self.handle = Some(search::search(root, &self.query, self.case_sensitive));
+        self.handle = Some(search::search(root, &self.query, self.case_sensitive, filters));
     }
 
     fn poll(&mut self) {
@@ -523,6 +513,25 @@ impl App {
                 }));
         });
 
+        let f = &mut self.filters;
+        let mut filter_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Hide:");
+            filter_changed |= ui.checkbox(&mut f.hide_hidden, "dotfiles").changed();
+            filter_changed |= ui.checkbox(&mut f.hide_git, ".git").changed();
+            filter_changed |= ui.checkbox(&mut f.hide_node_modules, "node_modules").changed();
+            filter_changed |= ui.checkbox(&mut f.hide_target, "target").changed();
+            filter_changed |= ui.checkbox(&mut f.hide_build, "build/dist/out").changed();
+            filter_changed |= ui.checkbox(&mut f.hide_obj_files, "binaries").changed();
+            filter_changed |= ui.checkbox(&mut f.hide_lock_files, "lockfiles").changed();
+            ui.separator();
+            filter_changed |= ui.checkbox(&mut f.respect_gitignore, ".gitignore").changed();
+        });
+        if filter_changed {
+            self.tree.dirty = true;
+        }
+        changed |= filter_changed;
+
         if changed {
             if self.search.query.is_empty() {
                 if let Some(h) = &self.search.handle {
@@ -532,7 +541,7 @@ impl App {
                 self.search.done = true;
                 self.search.handle = None;
             } else {
-                self.search.start(Path::new(&self.dir));
+                self.search.start(Path::new(&self.dir), &self.filters);
             }
         }
 
@@ -569,61 +578,77 @@ impl App {
         let text_color = ui.visuals().text_color();
         let dim_color = ui.visuals().weak_text_color();
 
+        use egui_extras::{TableBuilder, Column};
+
+        let char_w = ui.fonts(|f| f.glyph_width(&mono_id, ' '));
+        let size_w = char_w * 10.0;
+        let date_w = char_w * 18.0;
+        let path_w = (ui.available_width() - size_w - date_w).max(50.0);
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + ui.spacing().item_spacing.y;
         let total = self.search.results.len();
-        egui::ScrollArea::vertical().show_rows(ui, row_h, total, |ui, row_range| {
-            ui.set_min_width(ui.available_width());
-            let mono = egui::TextFormat {
-                font_id: mono_id.clone(),
-                color: text_color,
-                ..Default::default()
-            };
 
-            for i in row_range {
-                let result = &self.search.results[i];
-                let display = result.path.strip_prefix(&root)
-                    .unwrap_or(&result.path)
-                    .to_string_lossy();
-                let label = if result.is_dir {
-                    format!("{display}/")
-                } else {
-                    display.into_owned()
+        TableBuilder::new(ui)
+            .striped(false)
+            .vscroll(true)
+            .column(Column::exact(path_w).clip(true))     // path
+            .column(Column::exact(size_w))                 // size
+            .column(Column::exact(date_w))                 // date
+            .body(|body| {
+                let mono = egui::TextFormat {
+                    font_id: mono_id.clone(),
+                    color: text_color,
+                    ..Default::default()
                 };
 
-                let resp = ui.horizontal(|ui| {
-                    // Path — left-aligned
-                    let mut job = egui::text::LayoutJob::default();
-                    if is_glob {
-                        job.append(&label, 0.0, mono.clone());
+                body.rows(row_h, total, |mut row| {
+                    let i = row.index();
+                    let result = &self.search.results[i];
+                    let display = result.path.strip_prefix(&root)
+                        .unwrap_or(&result.path)
+                        .to_string_lossy();
+                    let label = if result.is_dir {
+                        format!("{display}/")
                     } else {
-                        append_highlighted(&mut job, &label, &query, case_sensitive, &mono, highlight_color);
-                    }
-                    ui.add(egui::Label::new(job).selectable(true));
+                        display.into_owned()
+                    };
 
-                    // Size + Date — right-aligned to window edge
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(accessed) = &result.accessed {
-                            ui.add(egui::Label::new(egui::RichText::new(format_time(accessed))
-                                .monospace()
-                                .color(dim_color)));
+                    // Path column
+                    row.col(|ui| {
+                        let mut job = egui::text::LayoutJob::default();
+                        if is_glob {
+                            job.append(&label, 0.0, mono.clone());
+                        } else {
+                            append_highlighted(&mut job, &label, &query, case_sensitive, &mono, highlight_color);
                         }
-                        if !result.is_dir {
-                            ui.add(egui::Label::new(egui::RichText::new(format_size_padded(result.size))
-                                .monospace()
-                                .color(size_color(result.size, size_upper))));
+                        let resp = ui.add(egui::Label::new(job).selectable(true).sense(egui::Sense::click()));
+                        if resp.hovered() {
+                            ui.painter().rect_filled(resp.rect, 0.0, hover_bg);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() {
+                            reveal_in_explorer(&result.path);
                         }
                     });
-                }).response;
 
-                if resp.hovered() {
-                    ui.painter().rect_filled(resp.rect, 0.0, hover_bg);
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if resp.interact(egui::Sense::click()).clicked() {
-                    reveal_in_explorer(&result.path);
-                }
-            }
-        });
+                    // Size column
+                    row.col(|ui| {
+                        if !result.is_dir {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add(egui::Label::new(egui::RichText::new(format_size(result.size))
+                                    .monospace().color(size_color(result.size, size_upper))));
+                            });
+                        }
+                    });
+
+                    // Date column
+                    row.col(|ui| {
+                        if let Some(accessed) = &result.accessed {
+                            ui.add(egui::Label::new(egui::RichText::new(format_time(accessed))
+                                .monospace().color(dim_color)));
+                        }
+                    });
+                });
+            });
     }
 }
 

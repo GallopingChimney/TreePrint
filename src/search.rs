@@ -51,13 +51,14 @@ pub fn is_glob(query: &str) -> bool {
     query.contains('*') || query.contains('?')
 }
 
-pub fn search(root: &Path, query: &str, case_sensitive: bool) -> SearchHandle {
+pub fn search(root: &Path, query: &str, case_sensitive: bool, filters: &crate::Filters) -> SearchHandle {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = unbounded::<SearchResult>();
 
     let root = root.to_path_buf();
     let query = query.to_owned();
     let cancel_clone = cancel.clone();
+    let filters = filters.clone();
 
     std::thread::spawn(move || {
         let is_glob_query = is_glob(&query);
@@ -65,15 +66,16 @@ pub fn search(root: &Path, query: &str, case_sensitive: bool) -> SearchHandle {
 
         WalkBuilder::new(&root)
             .threads(std::thread::available_parallelism().map_or(8, |n| n.get().min(8)))
-            .hidden(true)
-            .git_ignore(true)
+            .hidden(filters.hide_hidden)
+            .git_ignore(filters.respect_gitignore)
             .git_global(false)
-            .git_exclude(true)
+            .git_exclude(filters.respect_gitignore)
             .build_parallel()
             .run(|| {
                 let tx = tx.clone();
                 let prepared = prepared.clone();
                 let cancel = cancel_clone.clone();
+                let filters = filters.clone();
                 let is_glob_query = is_glob_query;
                 let case_sensitive = case_sensitive;
 
@@ -88,8 +90,13 @@ pub fn search(root: &Path, query: &str, case_sensitive: bool) -> SearchHandle {
                     };
 
                     let name = entry.file_name().to_string_lossy();
-                    let hay = if case_sensitive { name.to_string() } else { name.to_lowercase() };
+                    let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
 
+                    if filters.should_skip(&name, is_dir) {
+                        return if is_dir { ignore::WalkState::Skip } else { ignore::WalkState::Continue };
+                    }
+
+                    let hay = if case_sensitive { name.to_string() } else { name.to_lowercase() };
                     let matches = if is_glob_query {
                         glob_matches(&prepared, &hay)
                     } else {
@@ -97,8 +104,6 @@ pub fn search(root: &Path, query: &str, case_sensitive: bool) -> SearchHandle {
                     };
 
                     if matches {
-                        let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
-                        // Only stat for files (need size + accessed)
                         let (size, accessed) = if !is_dir {
                             entry.metadata().map_or((0, None), |m| {
                                 (m.len(), m.accessed().ok())
